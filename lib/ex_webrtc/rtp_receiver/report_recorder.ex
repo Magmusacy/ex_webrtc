@@ -40,6 +40,20 @@ defmodule ExWebRTC.RTPReceiver.ReportRecorder do
             total_lost: 0
 
   @doc """
+  Returns the number of packets lost so far, including the ones lost since the
+  last generated Receiver Report, and the interarrival jitter in seconds.
+
+  Jitter is `nil` until the clock rate is known.
+  """
+  @spec get_metrics(t()) :: %{packets_lost: non_neg_integer(), jitter: float() | nil}
+  def get_metrics(recorder) do
+    %{
+      packets_lost: min(recorder.total_lost + MapSet.size(recorder.lost_packets), @max_u24),
+      jitter: recorder.clock_rate && recorder.jitter / recorder.clock_rate
+    }
+  end
+
+  @doc """
   Records incoming RTP packet.
 
   `time` parameter accepts output of `System.monotonic_time()` as a value.

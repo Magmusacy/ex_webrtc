@@ -431,8 +431,9 @@ defmodule ExWebRTC.PeerConnection do
   If the underlying ICE or DTLS transport does not respond in time (e.g. it is
   overloaded), the corresponding stats are degraded to nil/empty values instead
   of raising, so this function always returns.
+
   """
-  @spec get_stats(peer_connection()) :: %{(atom() | integer()) => map()}
+  @spec get_stats(peer_connection()) :: %{(atom() | integer() | String.t()) => map()}
   def get_stats(peer_connection) do
     GenServer.call(peer_connection, :get_stats)
   end
@@ -2571,31 +2572,62 @@ defmodule ExWebRTC.PeerConnection do
 
   defp maybe_connect_sctp(state), do: state
 
+  defp receive_report_blocks(state, []), do: state
+
+  defp receive_report_blocks(state, blocks) do
+    time = System.os_time(:native)
+    blocks = Map.new(blocks, &{&1.ssrc, &1})
+
+    transceivers =
+      Enum.map(state.transceivers, fn tr ->
+        case Map.fetch(blocks, tr.sender.ssrc) do
+          {:ok, block} -> RTPTransceiver.receive_report_block(tr, block, time)
+          :error -> tr
+        end
+      end)
+
+    %{state | transceivers: transceivers}
+  end
+
   defp handle_rtcp_packet(state, %ExRTCP.Packet.ReceiverReport{} = report) do
-    with true <- :rtcp_reports in state.config.features,
-         {:ok, mid} <- Demuxer.demux_ssrc(state.demuxer, report.ssrc),
-         {_idx, transceiver} <- find_transceiver(state.transceivers, mid) do
-      {transceiver.receiver.track.id, state}
+    if :rtcp_reports in state.config.features do
+      state = receive_report_blocks(state, report.reports)
+
+      # the track id we report to the user is the incoming track of the peer
+      # that sent us this report, which may not be resolvable at all
+      track_id =
+        with {:ok, mid} <- Demuxer.demux_ssrc(state.demuxer, report.ssrc),
+             {_idx, transceiver} <- find_transceiver(state.transceivers, mid) do
+          transceiver.receiver.track.id
+        else
+          _other -> nil
+        end
+
+      {track_id, state}
     else
-      _other ->
-        {nil, state}
+      {nil, state}
     end
   end
 
   defp handle_rtcp_packet(state, %ExRTCP.Packet.SenderReport{} = report) do
-    with true <- :rtcp_reports in state.config.features,
-         {:ok, mid} <- Demuxer.demux_ssrc(state.demuxer, report.ssrc),
-         {idx, transceiver} <- find_transceiver(state.transceivers, mid) do
-      transceiver = RTPTransceiver.receive_report(transceiver, report)
-      transceivers = List.replace_at(state.transceivers, idx, transceiver)
-      {transceiver.receiver.track.id, %{state | transceivers: transceivers}}
-    else
-      false ->
-        {nil, state}
+    if :rtcp_reports in state.config.features do
+      # a sendrecv peer piggybacks its feedback about our streams on the
+      # reception report blocks of its own Sender Report; process them even
+      # when the SR itself cannot be matched to any of our receivers
+      state = receive_report_blocks(state, report.reports)
 
-      _other ->
-        Logger.warning("Unable to handle RTCP Sender Report, packet: #{inspect(report)}")
-        {nil, state}
+      with {:ok, mid} <- Demuxer.demux_ssrc(state.demuxer, report.ssrc),
+           {idx, transceiver} <- find_transceiver(state.transceivers, mid) do
+        transceiver = RTPTransceiver.receive_report(transceiver, report)
+        transceivers = List.replace_at(state.transceivers, idx, transceiver)
+        {transceiver.receiver.track.id, %{state | transceivers: transceivers}}
+      else
+        _other ->
+          Logger.warning("Unable to handle RTCP Sender Report, packet: #{inspect(report)}")
+          {nil, state}
+      end
+    else
+      {nil, state}
     end
   end
 
